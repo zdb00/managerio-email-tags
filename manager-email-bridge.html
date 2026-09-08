@@ -1,0 +1,441 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'self'">
+<meta name="referrer" content="no-referrer">
+<title>Manager Email Bridge</title>
+<style>
+body{margin:0;background:#f6f7f9;color:#202938;font:16px/1.6 system-ui,sans-serif}
+main{max-width:660px;margin:10vh auto;padding:32px;background:white;border:1px solid #dce0e6;border-radius:12px}
+h1{font-size:22px;margin:0 0 16px}p{margin:12px 0}small,dl{color:#586174}
+dt{font-weight:600}dd{margin:0 0 12px;overflow-wrap:anywhere}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px}
+button{font:inherit;border:1px solid #c9d1dd;border-radius:6px;background:white;padding:7px 16px;cursor:pointer}
+details{margin:20px 0}summary{cursor:pointer}#error{display:none}
+@media(max-width:720px){main{margin:20px;padding:24px}}
+</style>
+</head>
+<body>
+<main aria-live="polite">
+<h1 id="title">Manager Email Bridge</h1>
+<p id="status" role="status">Preparing invoice email…</p>
+<section id="error" role="alert">
+<p id="message"></p><dl id="context"></dl>
+<details><summary>Technical details</summary><pre id="details"></pre></details>
+<button id="retry" type="button">Try again</button>
+</section>
+</main>
+<script>
+"use strict";
+const APP_NAME = "Manager Email Bridge";
+const DEBUG = false;
+const PDF_FIELD = "2be520d4-1fa1-4118-a5a5-627e0576a1c4";
+const LIQUID_RESOURCE = "/resources/liquidjs/liquid.browser.min.js";
+const REQUIRED_FORM_FIELDS = ["To", "Subject", "Body", "Variables", "Filename", PDF_FIELD];
+const GUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const ALIAS_FIELDS = Object.freeze({
+  BusinessName: "businessName", CustomerName: "customerName", CustomerEmail: "customerEmail",
+  InvoiceNumber: "reference", InvoiceReference: "reference", InvoiceDate: "invoiceDateFormatted",
+  DueDate: "dueDateFormatted", InvoiceTotal: "totalFormatted", BalanceDue: "balanceDueFormatted"
+});
+
+class BridgeError extends Error {
+  constructor(message, operation, status = null, detail = "") {
+    super(message); this.name = "BridgeError"; this.operation = operation;
+    this.status = status; this.detail = detail;
+  }
+}
+function debug(label, value) { if (DEBUG) console.debug(APP_NAME + ": " + label, value); }
+function string(value) { return value == null ? "" : String(value); }
+function escapeHTML(value) {
+  return string(value).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+function fail(message, operation, detail = "") { throw new BridgeError(message, operation, null, detail); }
+
+// Loader adapter. The inline iframe's own Key identifies the CUSTOM BUTTON.
+// Only the containing Sales Invoice URL identifies the invoice.
+function detectEnvironment() {
+  if (window.parent === window) fail("Open a Sales Invoice and click Enhanced Email inside Manager.", "Detect launch environment");
+  let host, frame;
+  try {
+    host = window.parent;
+    if (host.location.origin !== location.origin) throw new Error();
+    frame = window.frameElement;
+  } catch {
+    fail("This launch is cross-origin. Install this HTML using Custom Buttons → Inline HTML inside Manager.", "Detect launch environment");
+  }
+  return { host, dialog: frame?.closest("dialog") ?? null,
+    loader: location.pathname === "/api4/custom-button-html" ? "custom-button-inline" : "same-origin-iframe" };
+}
+
+// Minimal read-only protobuf decoder for Manager's native URL context.
+// No URL synthesis: composer action and its complete query are reused verbatim.
+function decodeFields(bytes) {
+  let offset = 0;
+  const fields = new Map();
+  function varint() {
+    let value = 0, factor = 1;
+    for (let i = 0; i < 8; i++) {
+      if (offset >= bytes.length) throw new Error("Truncated varint");
+      const b = bytes[offset++]; value += (b & 127) * factor;
+      if (!Number.isSafeInteger(value)) throw new Error("Oversized varint");
+      if (!(b & 128)) return value;
+      factor *= 128;
+    }
+    throw new Error("Invalid varint");
+  }
+  while (offset < bytes.length) {
+    const tag = varint(), field = Math.floor(tag / 8), wire = tag & 7;
+    if (!field || fields.has(field)) throw new Error("Invalid or duplicate context field");
+    let length, value;
+    if (wire === 0) value = varint();
+    else {
+      if (wire === 1) length = 8;
+      else if (wire === 2) length = varint();
+      else if (wire === 5) length = 4;
+      else throw new Error("Unsupported context encoding");
+      if (offset + length > bytes.length) throw new Error("Truncated context field");
+      value = bytes.slice(offset, offset + length); offset += length;
+    }
+    fields.set(field, value);
+  }
+  return fields;
+}
+function decodeNativeURL(url) {
+  try {
+    let query = url.search.slice(1);
+    if (query.startsWith("q=")) query = new URLSearchParams(query).get("q");
+    if (!query || query.length > 32768 || !/^[A-Za-z0-9_-]+$/.test(query)) throw new Error();
+    return decodeFields(Uint8Array.from(atob(query.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0)));
+  } catch { fail("Manager's document URL format was not recognized.", "Decode document context"); }
+}
+function decodeGuid(bytes) {
+  if (!(bytes instanceof Uint8Array)) fail("The Sales Invoice key is missing.", "Decode invoice key");
+  try {
+    const parts = decodeFields(bytes), lo = parts.get(1), hi = parts.get(2);
+    if (lo?.length !== 8 || hi?.length !== 8) throw new Error();
+    const b = [...lo, ...hi];
+    const s = [3,2,1,0,5,4,7,6,8,9,10,11,12,13,14,15].map(i => b[i].toString(16).padStart(2,"0")).join("");
+    return `${s.slice(0,8)}-${s.slice(8,12)}-${s.slice(12,16)}-${s.slice(16,20)}-${s.slice(20)}`;
+  } catch { fail("Manager's invoice key encoding was not recognized.", "Decode invoice key"); }
+}
+function detectManagerContext(environment) {
+  const url = new URL(environment.host.location.href);
+  if (url.pathname !== "/sales-invoice-view") fail("Open an individual Sales Invoice before launching Enhanced Email.", "Detect Sales Invoice context");
+  const fields = decodeNativeURL(url), business = fields.get(100);
+  const context = { businessKey: business instanceof Uint8Array ? new TextDecoder("utf-8", {fatal:true}).decode(business) : "",
+    invoiceKey: decodeGuid(fields.get(200)), viewURL: url.href };
+  validateContext(context);
+  debug("environment", environment.loader); debug("context", context);
+  return context;
+}
+function validateContext(context) {
+  if (!context || typeof context.businessKey !== "string" || !context.businessKey.trim()) fail("The current business is missing.", "Validate business context");
+  if (!GUID.test(context.invoiceKey ?? "")) fail("The Sales Invoice key is missing or invalid.", "Validate invoice context");
+}
+
+// API adapter. Business is a NAME in current Manager, not a UUID.
+async function managerGET(endpoint, context, parameters = {}) {
+  const url = new URL("/api4/" + endpoint, location.origin);
+  url.searchParams.set("business", context.businessKey);
+  Object.entries(parameters).forEach(([key,value]) => url.searchParams.set(key, value));
+  const operation = "GET " + url.pathname;
+  debug("endpoint", url.pathname); // No cookies, headers, or response payloads.
+  let response;
+  try {
+    response = await fetch(url, {credentials:"same-origin", redirect:"error", signal:AbortSignal.timeout(20000), headers:{Accept:"application/json"}});
+  } catch { throw new BridgeError("Manager did not respond. Check your connection and session, then retry.", operation); }
+  debug("HTTP status", {endpoint:url.pathname,status:response.status});
+  if (!response.ok) throw new BridgeError("Manager could not load the required invoice data.", operation, response.status);
+  if (!response.headers.get("Content-Type")?.includes("application/json")) throw new BridgeError("Manager returned an unexpected page. Your session may have expired or this API may have changed.", operation, response.status);
+  try { return await response.json(); }
+  catch { throw new BridgeError("Manager returned invalid JSON.", operation, response.status); }
+}
+function fetchInvoiceData(context) { return managerGET("sales-invoice", context, {key:context.invoiceKey}); }
+function fetchInvoiceView(context) { return managerGET("view-v1", context, {key:context.invoiceKey,language:"en"}); }
+function fetchCustomerData(context, key) { return managerGET("customer", context, {key}); }
+function fetchCurrencyData(context, key) { return managerGET(key ? "foreign-currency" : "base-currency", context, key ? {key} : {}); }
+
+function uniqueValue(rows, key, label, operation) {
+  const keyed = rows.filter(x => x?.key === key);
+  const matches = keyed.length ? keyed : rows.filter(x => x?.label === label);
+  if (matches.length > 1) fail("Manager returned ambiguous " + label.toLowerCase() + " data.", operation);
+  return matches[0] ?? null;
+}
+function normalizeInvoiceData(context, record, view, customer, currency) {
+  validateContext(context);
+  if (!record || record.key?.toLowerCase() !== context.invoiceKey.toLowerCase()) fail("The Sales Invoice could not be found.", "Normalize invoice");
+  if (!customer || customer.key?.toLowerCase() !== record.customer?.toLowerCase()) fail("The invoice customer could not be found.", "Normalize customer");
+  if (!string(customer.email).trim()) fail("This customer has no email address. Add one in Manager, then reopen the invoice.", "Read customer email");
+  if (!record.issueDate || record.issueDate.startsWith("0001-")) fail("The invoice date is missing.", "Read invoice date");
+  if (!view || !Array.isArray(view.fields) || !Array.isArray(view.totals)) fail("The formatted invoice API has changed or returned no document.", "Normalize /api4/view-v1");
+  if (string(view.reference) !== string(record.reference)) fail("The invoice changed while preparing the email. Please retry.", "Verify invoice identity");
+  const invoiceDate = uniqueValue(view.fields,"InvoiceDate","Invoice date","Read invoice date");
+  const dueDate = uniqueValue(view.fields,"DueDate","Due date","Read due date");
+  const total = uniqueValue(view.totals,"Total","Total","Read invoice total");
+  const balance = uniqueValue(view.totals,"BalanceDue","Balance due","Read balance due");
+  if (!invoiceDate?.text) fail("The formatted invoice date is unavailable.", "Read invoice date");
+  if (!total || typeof total.text !== "string" || !total.text.trim() || !Number.isFinite(total.number)) fail("The invoice total is unavailable.", "Read invoice total");
+  if (record.hideBalanceDue !== false) fail("Balance due is hidden or unavailable. Disable Hide balance due on this invoice before using Enhanced Email.", "Read balance due");
+  let balanceFormatted, balanceRaw = null, balanceSource;
+  if (balance) {
+    if (typeof balance.text !== "string" || !balance.text.trim()) fail("The current balance due is unavailable.", "Read balance due");
+    balanceFormatted = balance.text;
+    // Current GetSalesInvoiceView does NOT populate balance.number: its zero is
+    // a serializer default, even on partially paid invoices. Never use it.
+    balanceSource = "Manager ledger-calculated Balance due text";
+  } else {
+    // Source-verified, explicit fallback: with HideBalanceDue=false, Manager
+    // emits Balance due whenever ANY non-invoice ledger transaction is matched.
+    // Restrict to ordinary invoices: unusual settlement rules fail closed.
+    if (record.withholdingTax || record.earlyPaymentDiscount || record.closedInvoice || total.number <= 0) {
+      fail("Manager omitted the current balance due for this invoice. Enhanced Email cannot safely determine it.", "Read balance due");
+    }
+    balanceFormatted = total.text; balanceRaw = total.number;
+    balanceSource = "Source-verified unadjusted invoice fallback (no Balance due row; HideBalanceDue=false)";
+  }
+  const hasExplicitDueDate = !record.hideDueDate &&
+    ((record.dueDate === 1 && Boolean(record.dueDateDate)) || (record.dueDate === 0 && record.dueDateDays != null));
+  if (hasExplicitDueDate && !dueDate?.text) fail("Manager did not return the configured due date.", "Read due date");
+  const invoice = {
+    businessKey:context.businessKey, businessName:string(view.business?.name ?? view.businessName),
+    invoiceKey:context.invoiceKey, reference:string(record.reference), customerKey:record.customer,
+    customerName:string(customer.name), customerEmail:string(customer.email),
+    invoiceDateRaw:record.issueDate, invoiceDateFormatted:invoiceDate.text,
+    dueDateRaw:hasExplicitDueDate && record.dueDate === 1 ? record.dueDateDate : null,
+    dueDateFormatted:hasExplicitDueDate ? dueDate.text : "",
+    totalRaw:total.number, totalFormatted:total.text,
+    balanceDueRaw:balanceRaw, balanceDueFormatted:balanceFormatted, balanceSource,
+    currency:string(currency?.code), attachmentKey:null
+  };
+  if (!invoice.businessName) fail("The business name is unavailable.", "Read business name");
+  debug("normalized invoice", invoice);
+  return invoice;
+}
+
+// Template engine: independent of Manager APIs, parent DOM, and loader.
+function buildAliases(invoice) {
+  return Object.fromEntries(Object.entries(ALIAS_FIELDS).map(([alias,field]) => [alias,string(invoice[field])]));
+}
+function buildLegacyLiquidContext(invoice) {
+  const context = {
+    reference:invoice.reference, recipient:{name:invoice.customerName,email:invoice.customerEmail},
+    business:{name:invoice.businessName},
+    fields:[{label:"Invoice date",text:invoice.invoiceDateFormatted},{label:"Due date",text:invoice.dueDateFormatted}],
+    table:{totals:[{label:"Total",text:invoice.totalFormatted},{label:"Balance due",text:invoice.balanceDueFormatted}]},
+    ...buildAliases(invoice)
+  };
+  debug("legacy Liquid context", context); return context;
+}
+function buildSimpleTagMap(invoice) {
+  const map = Object.fromEntries(Object.entries(buildAliases(invoice)).map(([key,value]) => ["{"+key+"}",value]));
+  debug("simple tag map", map); return map;
+}
+function replaceSimpleTags(template, map, {html = false, defer = false} = {}) {
+  // Skip complete Liquid output/tag tokens, including strings inside them.
+  // Exact single braces only: {{CustomerName}} and unknown tags are preserved.
+  return string(template).replace(/{{[\s\S]*?}}|{%[\s\S]*?%}|(?<!{){[A-Za-z][A-Za-z0-9]*}(?!})/g, token => {
+    if (!Object.hasOwn(map,token)) return token;
+    // Native Liquid inserts variable values as data, never parses them again.
+    // This also prevents a customer's "{% ... %}" name becoming template code.
+    if (defer) return "{{ __ManagerEmailBridgeTags." + token.slice(1,-1) + " }}";
+    return html ? escapeHTML(map[token]) : string(map[token]);
+  });
+}
+function mapStrings(value, transform) {
+  if (typeof value === "string") return transform(value);
+  if (Array.isArray(value)) return value.map(x => mapStrings(x,transform));
+  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k,v]) => [k,mapStrings(v,transform)]));
+  return value;
+}
+function buildNativeEmailRequest(invoice, templates) {
+  const plain = buildLegacyLiquidContext(invoice), tags = buildSimpleTagMap(invoice);
+  const bodyContext = mapStrings(plain, escapeHTML);
+  const variables = {...bodyContext, __ManagerEmailBridgePlain:plain,
+    __ManagerEmailBridgeTags:buildAliases(invoice)};
+  // The composer renders each template with a separate Liquid scope. Restore
+  // plain values in the subject; HTML-escaped values remain in the body scope.
+  const subjectPrefix = Object.keys(plain).map(k => "{% assign " + k + " = __ManagerEmailBridgePlain." + k + " %}").join("");
+  // Simple tags have their own per-channel values, so subject data stays plain.
+  const bodyPrefix = "{% assign __ManagerEmailBridgeTags = __ManagerEmailBridgeBodyTags %}";
+  variables.__ManagerEmailBridgeBodyTags = mapStrings(buildAliases(invoice), escapeHTML);
+  let serialized;
+  try { serialized = JSON.stringify(variables); JSON.parse(serialized); }
+  catch { fail("The email variables could not be serialized.", "Serialize Variables"); }
+  return {To:invoice.customerEmail,
+    Subject:subjectPrefix + replaceSimpleTags(templates.subject,tags,{defer:true}),
+    Body:bodyPrefix + replaceSimpleTags(templates.body,tags,{defer:true}), Variables:serialized};
+}
+
+// Native composer adapter (approach C). No alternative PDF implementation.
+function getNativeEmailConfiguration(environment, context) {
+  const host = environment.host;
+  if (host.location.href !== context.viewURL) fail("The open invoice changed. Reopen Enhanced Email on the intended invoice.", "Locate native Email form");
+  const forms = Array.from(host.document.forms).filter(f => f.querySelector('input[name="Variables"]'));
+  if (forms.length !== 1) fail("The native Email action is unavailable. Check Manager's email configuration or whether its composer has changed.", "Locate native Email form");
+  const form = forms[0], action = new URL(form.action,host.location.href);
+  if (action.origin !== location.origin || action.pathname !== "/email-form" || form.method.toLowerCase() !== "post" || form.getAttribute("hx-boost") !== "true") {
+    fail("Manager's native composer contract has changed. The bridge did not submit anything.", "Validate native composer route");
+  }
+  const fields = {};
+  for (const name of REQUIRED_FORM_FIELDS) {
+    const matches = Array.from(form.elements).filter(e => e.name === name);
+    if (matches.length !== 1 || matches[0].tagName !== "INPUT" || matches[0].type !== "hidden" || matches[0].disabled) {
+      fail("A required native Email field is missing or changed.", "Validate native Email form", "Expected one enabled hidden input: " + name);
+    }
+    fields[name] = matches[0];
+  }
+  const source = decodeGuid(decodeNativeURL(action).get(1));
+  if (source !== context.invoiceKey.toLowerCase()) fail("The native Email action belongs to a different invoice.", "Validate native PDF source");
+  if (!host.htmx || typeof host.getBlob !== "function" || typeof host.getIframeTitle !== "function") {
+    fail("Manager's native PDF/email helpers are unavailable. Reload the invoice and retry.", "Validate native PDF handling");
+  }
+  debug("composer route", action.pathname); debug("native POST field names", Array.from(form.elements).map(e=>e.name).filter(Boolean));
+  return {form, fields, action:action.href, subject:fields.Subject.value, body:fields.Body.value};
+}
+async function ensureManagerLiquid(environment) {
+  const host = environment.host;
+  if (typeof host.liquidjs?.Liquid === "function") return host.liquidjs;
+  return new Promise((resolve,reject) => {
+    const script = host.document.createElement("script");
+    const timer = setTimeout(() => done(false),20000);
+    function done(ok) {
+      clearTimeout(timer); script.onload = script.onerror = null;
+      if (ok && typeof host.liquidjs?.Liquid === "function") resolve(host.liquidjs);
+      else { script.remove(); reject(new BridgeError("Manager's bundled LiquidJS could not be loaded.", "Load Manager LiquidJS", null, LIQUID_RESOURCE)); }
+    }
+    script.onload = () => done(true); script.onerror = () => done(false);
+    script.src = new URL(LIQUID_RESOURCE,location.origin).href;
+    host.document.head.appendChild(script);
+  });
+}
+async function waitForNativeInvoice(environment) {
+  const deadline = Date.now() + 20000;
+  while (Date.now() < deadline) {
+    try {
+      // Wait for the existing native invoice, including a nested custom theme.
+      const outer = environment.host.document.getElementById("iframeView");
+      const nested = outer?.contentDocument?.getElementById("iframeView");
+      const doc = (nested ?? outer)?.contentDocument;
+      if (doc?.readyState === "complete" && doc.title.trim()) return;
+    } catch { break; }
+    await new Promise(resolve => setTimeout(resolve,100));
+  }
+  fail("Manager's invoice preview is not ready. Wait for the invoice to finish loading, then retry.", "Wait for native PDF source");
+}
+async function openNativeComposer(environment, context, request, expected) {
+  const native = getNativeEmailConfiguration(environment, context), host = environment.host;
+  if (native.subject !== expected.subject || native.body !== expected.body) fail("The email template changed while preparing the email. Please retry.", "Validate template before handoff");
+  await waitForNativeInvoice(environment);
+  if (environment.dialog && !environment.dialog.open) fail("Email preparation was cancelled.", "Open native composer");
+  debug("final handoff method", "Native form.requestSubmit → Manager htmx PDF hook → POST /email-form");
+  return new Promise((resolve,reject) => {
+    const originals = Object.fromEntries(Object.keys(request).map(k=>[k,native.fields[k].value]));
+    let sent = false, complete = false;
+    const timer = setTimeout(() => finish(new BridgeError("Manager did not finish opening the composer. Check its PDF error message and try again.", "Native composer handoff")),60000);
+    function finish(error) {
+      if (complete) return; complete = true; clearTimeout(timer);
+      host.document.removeEventListener("htmx:beforeRequest",before);
+      host.document.removeEventListener("htmx:afterRequest",after);
+      // Restore the entry form if navigation failed; never change composer fields.
+      if (native.form.isConnected) for (const [k,v] of Object.entries(originals)) native.fields[k].value = v;
+      if (error) reject(error); else resolve();
+    }
+    function before(event) {
+      if (event.detail.elt !== native.form) return;
+      if (!native.fields[PDF_FIELD].value || !native.fields.Filename.value) {
+        event.preventDefault(); finish(new BridgeError("Manager did not attach the native invoice PDF.", "Validate native PDF attachment")); return;
+      }
+      sent = true;
+      if (environment.dialog?.open) environment.dialog.close();
+    }
+    function after(event) {
+      if (event.detail.elt !== native.form || !sent) return;
+      const status = event.detail.xhr?.status;
+      if (event.detail.successful && status >= 200 && status < 300) finish();
+      else {
+        if (environment.dialog?.isConnected) environment.dialog.showModal();
+        finish(new BridgeError("Manager could not open its email composer.", "POST /email-form",status));
+      }
+    }
+    host.document.addEventListener("htmx:beforeRequest",before);
+    host.document.addEventListener("htmx:afterRequest",after);
+    for (const [k,v] of Object.entries(request)) native.fields[k].value = v;
+    try { native.form.requestSubmit(); }
+    catch { finish(new BridgeError("Manager's Email action could not be submitted.", "Native composer handoff")); }
+  });
+}
+
+async function runEmailBridge(context, adapter) {
+  validateContext(context);
+  const configuration = adapter.getConfiguration(context);
+  const [record,view] = await Promise.all([fetchInvoiceData(context),fetchInvoiceView(context)]);
+  if (!GUID.test(record?.customer ?? "")) fail("The Sales Invoice has no customer.", "Read customer key");
+  const customer = await fetchCustomerData(context,record.customer);
+  if (!customer) fail("The invoice customer no longer exists.", "Read customer");
+  const currency = await fetchCurrencyData(context,customer.currency);
+  const invoice = normalizeInvoiceData(context,record,view,customer,currency);
+  const request = buildNativeEmailRequest(invoice,configuration);
+  const liquid = await adapter.getLiquid();
+  // Preflight uses Manager's exact engine to catch errors BEFORE navigation.
+  // Native EmailForm still performs the final render and remains editable.
+  try {
+    const engine = new liquid.Liquid();
+    await Promise.all([engine.parseAndRender(request.Subject,JSON.parse(request.Variables)),engine.parseAndRender(request.Body,JSON.parse(request.Variables))]);
+  } catch { fail("The configured email template contains invalid or unsupported Liquid.", "Validate email template"); }
+  await adapter.open(context,request,configuration);
+  return invoice;
+}
+
+function renderLoading() {
+  document.getElementById("status").textContent = "Preparing invoice email…";
+  document.getElementById("error").style.display = "none";
+}
+function renderError(error,context) {
+  document.getElementById("status").textContent = "The email could not be prepared.";
+  document.getElementById("error").style.display = "block";
+  document.getElementById("message").textContent = error instanceof BridgeError ? error.message : "An unexpected error occurred. Reload the invoice and try again.";
+  const list = document.getElementById("context"); list.replaceChildren();
+  for (const [label,value] of Object.entries({Business:context?.businessKey,Invoice:context?.invoiceKey,Operation:error.operation,"HTTP status":error.status})) {
+    if (value == null) continue;
+    const dt = document.createElement("dt"), dd = document.createElement("dd");
+    dt.textContent = label; dd.textContent = value; list.append(dt,dd);
+  }
+  document.getElementById("details").textContent = error instanceof BridgeError ? error.detail || "No additional details. No email was sent by the extension." : "Unexpected error type: " + error.name;
+}
+let active = false;
+async function start() {
+  if (active) return; active = true; let context;
+  renderLoading();
+  try {
+    const environment = detectEnvironment();
+    context = detectManagerContext(environment);
+    await runEmailBridge(context,{
+      getConfiguration:c=>getNativeEmailConfiguration(environment,c),
+      getLiquid:()=>ensureManagerLiquid(environment),
+      open:(c,r,t)=>openNativeComposer(environment,c,r,t)
+    });
+  } catch (error) { renderError(error,context); }
+  finally { active = false; }
+}
+function initialize() {
+  document.title = APP_NAME; document.getElementById("title").textContent = APP_NAME;
+  document.getElementById("retry").addEventListener("click",start);
+  try {
+    const environment = detectEnvironment();
+    if (environment.dialog && !environment.dialog.open) {
+      // Lazy iframes can load before a click; never open an email spontaneously.
+      const observer = new MutationObserver(() => {
+        if (environment.dialog.open) { observer.disconnect(); start(); }
+      });
+      observer.observe(environment.dialog,{attributes:true,attributeFilter:["open"]});
+    } else start();
+  } catch (error) { renderError(error); }
+}
+window.ManagerEmailBridge = Object.freeze({runEmailBridge,normalizeInvoiceData,buildLegacyLiquidContext,
+  buildSimpleTagMap,replaceSimpleTags,buildNativeEmailRequest,decodeNativeURL,decodeGuid});
+initialize();
+</script>
+</body>
+</html>
