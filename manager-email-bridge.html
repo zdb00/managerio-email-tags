@@ -156,6 +156,104 @@ function fetchInvoiceData(context) { return managerGET("sales-invoice", context,
 function fetchInvoiceView(context) { return managerGET("view-v1", context, {key:context.invoiceKey,language:"en"}); }
 function fetchCustomerData(context, key) { return managerGET("customer", context, {key}); }
 function fetchCurrencyData(context, key) { return managerGET(key ? "foreign-currency" : "base-currency", context, key ? {key} : {}); }
+function fetchNumberFormat(context) { return managerGET("date-and-number-format", context); }
+
+// Manager stores number separators/group sizes as base64 protobuf, not a locale.
+function normalizeNumberFormat(settings) {
+  if (!settings || typeof settings !== "object") fail("Manager's number format is unavailable.", "Read amount formatting");
+  if (settings.numberFormat == null || settings.numberFormat === "") return {decimal:".",group:",",sizes:[3]};
+  try {
+    if (typeof settings.numberFormat !== "string" || settings.numberFormat.length > 1024) throw Error();
+    const bytes = Uint8Array.from(atob(settings.numberFormat), c => c.charCodeAt(0));
+    let offset = 0;
+    const format = {decimal:null,group:"",sizes:[]}, seen = new Set();
+    function readInt() {
+      let value = 0, factor = 1;
+      for (let i = 0; i < 5 && offset < bytes.length; i++) {
+        const byte = bytes[offset++]; value += (byte & 127) * factor;
+        if (!(byte & 128)) return value;
+        factor *= 128;
+      }
+      throw Error();
+    }
+    while (offset < bytes.length) {
+      const tag = readInt(), field = tag >> 3, wire = tag & 7;
+      if (field === 3 && wire === 0) { format.sizes.push(readInt()); continue; }
+      if (![1,2,3].includes(field) || wire !== 2) throw Error();
+      const length = readInt(), end = offset + length;
+      if (end > bytes.length) throw Error();
+      if (field === 3) {
+        while (offset < end) format.sizes.push(readInt());
+        if (offset !== end) throw Error();
+      } else {
+        if (seen.has(field)) throw Error();
+        seen.add(field);
+        format[field === 1 ? "decimal" : "group"] = new TextDecoder("utf-8",{fatal:true}).decode(bytes.slice(offset,end));
+        offset = end;
+      }
+    }
+    if (!format.decimal || /[0-9+-]/.test(format.decimal + format.group) ||
+        (format.group && (format.decimal.includes(format.group) || format.group.includes(format.decimal))) ||
+        !format.sizes.length || format.sizes.some((n,i) => n > 9 || (n === 0 && i !== format.sizes.length-1))) throw Error();
+    return format;
+  } catch { fail("Manager's number format was not recognized. Use the default amount tags or check the number format settings.", "Read amount formatting"); }
+}
+function groupAmountDigits(digits, format) {
+  if (!format.group) return digits;
+  const groups = []; let end = digits.length, index = 0;
+  while (end > 0) {
+    const size = format.sizes[Math.min(index,format.sizes.length-1)];
+    if (!size || end <= size) { groups.unshift(digits.slice(0,end)); break; }
+    groups.unshift(digits.slice(end-size,end)); end -= size; index++;
+  }
+  return groups.join(format.group);
+}
+function normalizeAmountParts(text, currency, format) {
+  // Decode the displayed ledger amount with exact known affixes/separators.
+  // Never parseFloat localized text or trust balance.number's default zero.
+  let prefix = string(currency?.prefix), suffix = string(currency?.suffix);
+  if (!prefix.trim() && !suffix.trim()) suffix = string(currency?.code);
+  const negative = text.startsWith("- ");
+  const start = (negative ? "- " : "") + prefix + " ", end = (" " + suffix).trimEnd();
+  if (!text.startsWith(start) || (end && !text.endsWith(end))) fail("An amount no longer matches Manager's currency format. Use the default amount tags or retry.", "Read amount formatting");
+  const number = text.slice(start.length,end ? -end.length : undefined);
+  const parts = number.split(format.decimal), integer = parts[0], fraction = parts[1] ?? "";
+  const digits = format.group ? integer.split(format.group).join("") : integer;
+  if (parts.length > 2 || !/^(0|[1-9][0-9]*)$/.test(digits) ||
+      (parts.length === 2 && !/^[0-9]+$/.test(fraction)) || fraction.length > 28 ||
+      groupAmountDigits(digits,format) !== integer) fail("An amount could not be formatted safely. Use the default amount tags or check the number format settings.", "Read amount formatting");
+  return {digits,fraction,negative,prefix,suffix,format};
+}
+function formatAmount(parts, style, precision, noGrouping) {
+  const places = precision === "NoDecimals" ? 0 : precision === "2Decimals" ? 2 : parts.fraction.length;
+  let digits = parts.digits + parts.fraction.slice(0,places).padEnd(places,"0");
+  // Decimal integer arithmetic avoids floating-point rounding (e.g. 1.005).
+  let units = BigInt(digits);
+  if (parts.fraction.length > places && parts.fraction[places] >= "5") units += 1n;
+  digits = units.toString().padStart(places+1,"0");
+  const integer = places ? digits.slice(0,-places) : digits;
+  const number = (noGrouping ? integer : groupAmountDigits(integer,parts.format)) +
+    (places ? parts.format.decimal + digits.slice(-places) : "");
+  const negative = parts.negative && units !== 0n;
+  if (style === "NoCurrency") return (negative ? "-" : "") + number;
+  if (style === "Compact") return (negative ? "-" : "") + parts.prefix.trim() + number + parts.suffix.trim();
+  if (style === "Spaced") return (negative ? "- " : "") + [parts.prefix.trim(),number,parts.suffix.trim()].filter(Boolean).join(" ");
+  return ((negative ? "- " : "") + parts.prefix + " " + number + " " + parts.suffix).trimEnd();
+}
+function buildAmountAliases(invoice) {
+  const aliases = {};
+  for (const [name,parts] of Object.entries(invoice.amountParts ?? {})) {
+    for (const style of ["","NoCurrency","Compact","Spaced"]) {
+      for (const precision of ["","NoDecimals","2Decimals"]) {
+        for (const grouping of ["","NoGrouping"]) {
+          const suffix = [style,precision,grouping].filter(Boolean).join("_");
+          if (suffix) aliases[name+"_"+suffix] = formatAmount(parts,style,precision,Boolean(grouping));
+        }
+      }
+    }
+  }
+  return aliases;
+}
 
 function uniqueValue(rows, key, label, operation) {
   const keyed = rows.filter(x => x?.key === key);
@@ -163,7 +261,15 @@ function uniqueValue(rows, key, label, operation) {
   if (matches.length > 1) fail("Manager returned ambiguous " + label.toLowerCase() + " data.", operation);
   return matches[0] ?? null;
 }
-function normalizeInvoiceData(context, record, view, customer, currency) {
+function normalizeCustomFields(fields) {
+  // view-v1 identifies real custom fields by GUID; built-in fields use names.
+  // Only use Manager's display text, never image URLs or hidden record values.
+  return fields.filter(field => field && GUID.test(string(field.key)) &&
+    typeof field.label === "string" && field.label.length > 0 &&
+    !/[{}\r\n]/.test(field.label) && !field.image && typeof field.text === "string")
+    .map(field => ({key:field.key,label:field.label,text:field.text.trimEnd()}));
+}
+function normalizeInvoiceData(context, record, view, customer, currency, numberSettings = null) {
   validateContext(context);
   if (!record || record.key?.toLowerCase() !== context.invoiceKey.toLowerCase()) fail("The Sales Invoice could not be found.", "Normalize invoice");
   if (!customer || customer.key?.toLowerCase() !== record.customer?.toLowerCase()) fail("The invoice customer could not be found.", "Normalize customer");
@@ -205,18 +311,38 @@ function normalizeInvoiceData(context, record, view, customer, currency) {
     invoiceDateRaw:record.issueDate, invoiceDateFormatted:invoiceDate.text,
     dueDateRaw:hasExplicitDueDate && record.dueDate === 1 ? record.dueDateDate : null,
     dueDateFormatted:hasExplicitDueDate ? dueDate.text : "",
-    totalRaw:total.number, totalFormatted:total.text,
-    balanceDueRaw:balanceRaw, balanceDueFormatted:balanceFormatted, balanceSource,
-    currency:string(currency?.code), attachmentKey:null
+    // Manager computes overdue from the live ledger balance and its server date.
+    // Do not parse formatted money/dates or infer overdue from an old due date.
+    isOverdue:hasExplicitDueDate && view.status?.text === "Overdue" && view.status?.tone === "negative",
+    // Remove Manager's trailing currency whitespace, preserving internal spacing.
+    totalRaw:total.number, totalFormatted:total.text.trimEnd(),
+    balanceDueRaw:balanceRaw, balanceDueFormatted:balanceFormatted.trimEnd(), balanceSource,
+    currency:string(currency?.code), attachmentKey:null,
+    customFields:normalizeCustomFields(view.fields)
   };
   if (!invoice.businessName) fail("The business name is unavailable.", "Read business name");
+  if (numberSettings !== null) {
+    const format = normalizeNumberFormat(numberSettings);
+    invoice.amountParts = {
+      InvoiceTotal:normalizeAmountParts(invoice.totalFormatted,currency,format),
+      BalanceDue:normalizeAmountParts(invoice.balanceDueFormatted,currency,format)
+    };
+  }
   debug("normalized invoice", invoice);
   return invoice;
 }
 
 // Template engine: independent of Manager APIs, parent DOM, and loader.
 function buildAliases(invoice) {
-  return Object.fromEntries(Object.entries(ALIAS_FIELDS).map(([alias,field]) => [alias,string(invoice[field])]));
+  return {...Object.fromEntries(Object.entries(ALIAS_FIELDS).map(([alias,field]) => [alias,string(invoice[field])])),
+    ...buildAmountAliases(invoice)};
+}
+function buildCustomFieldMap(invoice) {
+  const fields = invoice.customFields ?? [], counts = new Map();
+  for (const field of fields) counts.set(field.label,(counts.get(field.label) ?? 0) + 1);
+  // Invoice and customer fields can share labels. Never choose one arbitrarily.
+  return Object.fromEntries(fields.filter(field => counts.get(field.label) === 1)
+    .map(field => [field.label,field.text]));
 }
 function buildLegacyLiquidContext(invoice) {
   const context = {
@@ -224,22 +350,26 @@ function buildLegacyLiquidContext(invoice) {
     business:{name:invoice.businessName},
     fields:[{label:"Invoice date",text:invoice.invoiceDateFormatted},{label:"Due date",text:invoice.dueDateFormatted}],
     table:{totals:[{label:"Total",text:invoice.totalFormatted},{label:"Balance due",text:invoice.balanceDueFormatted}]},
-    ...buildAliases(invoice)
+    ...buildAliases(invoice), IsOverdue:invoice.isOverdue === true,
+    CustomFields:buildCustomFieldMap(invoice)
   };
   debug("legacy Liquid context", context); return context;
 }
 function buildSimpleTagMap(invoice) {
   const map = Object.fromEntries(Object.entries(buildAliases(invoice)).map(([key,value]) => ["{"+key+"}",value]));
+  for (const [label,value] of Object.entries(buildCustomFieldMap(invoice))) map["{CustomField_"+label+"}"] = value;
   debug("simple tag map", map); return map;
 }
 function replaceSimpleTags(template, map, {html = false, defer = false} = {}) {
   // Skip complete Liquid output/tag tokens, including strings inside them.
   // Exact single braces only: {{CustomerName}} and unknown tags are preserved.
-  return string(template).replace(/{{[\s\S]*?}}|{%[\s\S]*?%}|(?<!{){[A-Za-z][A-Za-z0-9]*}(?!})/g, token => {
+  const indices = new Map(Object.keys(map).map((key,index) => [key,index]));
+  return string(template).replace(/{{[\s\S]*?}}|{%[\s\S]*?%}|(?<!{){(?:CustomField_[^{}\r\n]+|[A-Za-z][A-Za-z0-9_]*)}(?!})/g, token => {
     if (!Object.hasOwn(map,token)) return token;
     // Native Liquid inserts variable values as data, never parses them again.
     // This also prevents a customer's "{% ... %}" name becoming template code.
-    if (defer) return "{{ __ManagerEmailBridgeTags." + token.slice(1,-1) + " }}";
+    // Numeric lookups keep field labels (including quotes) out of Liquid code.
+    if (defer) return "{{ __ManagerEmailBridgeTags[" + indices.get(token) + "] }}";
     return html ? escapeHTML(map[token]) : string(map[token]);
   });
 }
@@ -253,13 +383,13 @@ function buildNativeEmailRequest(invoice, templates) {
   const plain = buildLegacyLiquidContext(invoice), tags = buildSimpleTagMap(invoice);
   const bodyContext = mapStrings(plain, escapeHTML);
   const variables = {...bodyContext, __ManagerEmailBridgePlain:plain,
-    __ManagerEmailBridgeTags:buildAliases(invoice)};
+    __ManagerEmailBridgeTags:Object.values(tags)};
   // The composer renders each template with a separate Liquid scope. Restore
   // plain values in the subject; HTML-escaped values remain in the body scope.
   const subjectPrefix = Object.keys(plain).map(k => "{% assign " + k + " = __ManagerEmailBridgePlain." + k + " %}").join("");
   // Simple tags have their own per-channel values, so subject data stays plain.
   const bodyPrefix = "{% assign __ManagerEmailBridgeTags = __ManagerEmailBridgeBodyTags %}";
-  variables.__ManagerEmailBridgeBodyTags = mapStrings(buildAliases(invoice), escapeHTML);
+  variables.__ManagerEmailBridgeBodyTags = mapStrings(Object.values(tags), escapeHTML);
   let serialized;
   try { serialized = JSON.stringify(variables); JSON.parse(serialized); }
   catch { fail("The email variables could not be serialized.", "Serialize Variables"); }
@@ -374,8 +504,12 @@ async function runEmailBridge(context, adapter) {
   if (!GUID.test(record?.customer ?? "")) fail("The Sales Invoice has no customer.", "Read customer key");
   const customer = await fetchCustomerData(context,record.customer);
   if (!customer) fail("The invoice customer no longer exists.", "Read customer");
-  const currency = await fetchCurrencyData(context,customer.currency);
-  const invoice = normalizeInvoiceData(context,record,view,customer,currency);
+  // Additional settings are needed only when an amount-format suffix is used.
+  const wantsAmountFormat = /(?:InvoiceTotal|BalanceDue)_(?:NoCurrency|Compact|Spaced|NoDecimals|2Decimals|NoGrouping)(?![A-Za-z0-9])/.test(configuration.subject + "\n" + configuration.body);
+  const [currency,numberSettings] = await Promise.all([fetchCurrencyData(context,customer.currency),
+    wantsAmountFormat ? fetchNumberFormat(context) : Promise.resolve(null)]);
+  if (wantsAmountFormat && !numberSettings) fail("Manager's number format is unavailable.", "Read amount formatting");
+  const invoice = normalizeInvoiceData(context,record,view,customer,currency,numberSettings);
   const request = buildNativeEmailRequest(invoice,configuration);
   const liquid = await adapter.getLiquid();
   // Preflight uses Manager's exact engine to catch errors BEFORE navigation.
